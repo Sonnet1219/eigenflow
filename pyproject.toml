@@ -22,6 +22,7 @@ dependencies = [
     "fastapi",
     "uvicorn",
     "python-multipart",
+    "httpx>=0.27",
     "supabase",
     "pyalex>=0.18"
 ]

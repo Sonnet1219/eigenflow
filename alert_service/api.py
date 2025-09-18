@@ -1,212 +1,418 @@
-"""Alert Service API endpoints."""
+"""Alert Service API endpoints implementing PRD-compliant monitoring."""
+
+from __future__ import annotations
 
 import asyncio
+import json
 import logging
-import uuid
-from datetime import datetime
-from typing import Dict, Any, List
-from fastapi import APIRouter, BackgroundTasks
-from langchain_core.messages import HumanMessage
+from datetime import datetime, timezone
+from typing import Any, Dict, List
 
-# Import data gateway from main project
+from fastapi import APIRouter, BackgroundTasks, HTTPException
+
+from alert_service.config import AlertSeverity, MonitoringConfig
+from alert_service.models import AlertRecord, HumanAction, HumanActionRequest
+from alert_service.orchestrator_client import OrchestratorClient
+from alert_service.state_manager import AlertStateManager
 from src.agent.data_gateway import EigenFlowAPI
-from src.agent.graph import graph as _margin_graph_builder
-from src.agent.schemas import IntentContext
-
-try:
-    from langgraph.checkpoint.memory import MemorySaver
-except Exception:  # pragma: no cover - fallback if module path changes
-    MemorySaver = None
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/alert", tags=["alert"])
 
-if hasattr(_margin_graph_builder, "ainvoke"):
-    margin_analysis_graph = _margin_graph_builder
-else:
-    try:
-        if hasattr(_margin_graph_builder, "compile"):
-            kwargs = {"checkpointer": MemorySaver()} if MemorySaver else {}
-            margin_analysis_graph = _margin_graph_builder.compile(**kwargs)
-        else:
-            raise AttributeError("Graph builder does not support compile()")
-    except Exception as compile_error:
-        logger.error("Failed to compile margin analysis graph: %s", compile_error)
-        margin_analysis_graph = None
 
-# Configuration
-MONITORING_INTERVAL = 60  # seconds
-MARGIN_THRESHOLD = 20  # percentage
+config = MonitoringConfig()
+state_manager = AlertStateManager(config)
+orchestrator_client = OrchestratorClient(
+    config.orchestrator_base_url,
+    timeout_seconds=config.orchestrator_timeout_seconds,
+)
 
 
 class MonitoringService:
-    """LP margin monitoring service."""
-    
-    def __init__(self):
+    """LP margin monitoring service with hysteresis and HITL integration."""
+
+    def __init__(self) -> None:
         self.is_running = False
         self.api_client = EigenFlowAPI()
-        self.last_alerts = {}  # Track last alert time for each LP
-    
-    async def monitor_margins(self):
-        """Monitor LP margins and log alerts when thresholds are exceeded."""
-        self.is_running = True
-        logger.info("Starting LP margin monitoring service")
-        
-        while self.is_running:
-            try:
-                # Fetch LP account data
-                accounts = await self.fetch_lp_data()
+        self._lock = asyncio.Lock()
+        self._last_blowup: Dict[str, datetime] = {}
 
-                alert_triggered = False
-                healthy_lps = []
-                
-                for account in accounts:
-                    lp_name = account.get("LP", "Unknown")
-                    margin_level = account.get("Margin Utilization %", 0)  # Already in percentage
-                    
-                    # Check if margin level exceeds threshold
-                    if margin_level > MARGIN_THRESHOLD:
-                        # Check if we already logged an alert recently (avoid spam)
-                        last_alert = self.last_alerts.get(lp_name)
-                        now = datetime.now()
+    async def monitor_margins(self) -> None:
+        """Monitor LP margins and trigger orchestrator flows."""
+        async with self._lock:
+            if self.is_running:
+                logger.info("Monitoring service already running")
+                return
+            self.is_running = True
 
-                        if not last_alert or (now - last_alert).seconds > MONITORING_INTERVAL:
-                            self.last_alerts[lp_name] = now
-                            logger.warning(f"🚨 MARGIN ALERT: {lp_name} margin level {margin_level:.2f}% exceeds threshold {MARGIN_THRESHOLD}%")
-                            alert_triggered = True
-
-                            try:
-                                await self.trigger_margin_report(lp_name, margin_level)
-                            except Exception as report_error:
-                                logger.error(f"Failed to generate margin report for {lp_name}: {report_error}")
-                    else:
-                        healthy_lps.append(f"{lp_name} ({margin_level:.2f}%)")
-                
-                # Report healthy status if no alerts were triggered
-                if not alert_triggered and healthy_lps:
-                    logger.info(f"✅ All LPs healthy: {', '.join(healthy_lps)} - all below {MARGIN_THRESHOLD}% threshold")
-                
-                # Wait before next check
-                await asyncio.sleep(MONITORING_INTERVAL)
-                
-            except Exception as e:
-                logger.error(f"Error in monitoring loop: {e}")
-                await asyncio.sleep(MONITORING_INTERVAL)
-    
-    async def fetch_lp_data(self) -> List[Dict[str, Any]]:
-        """Fetch LP account data from Data Gateway."""
+        logger.info(
+            "Starting LP margin monitoring service",
+            extra={"interval": config.monitoring_interval},
+        )
         try:
-            # Authenticate if needed
-            if not self.api_client.access_token:
-                auth_result = self.api_client.authenticate()
-                if not auth_result.get("success"):
-                    logger.error(f"Authentication failed: {auth_result.get('error')}")
-                    return []
-            
-            # Fetch account data
-            accounts_result = self.api_client.get_lp_accounts()
-            return accounts_result if isinstance(accounts_result, list) else []
-            
-        except Exception as e:
-            logger.error(f"Error fetching LP data: {e}")
-            return []
+            while self.is_running:
+                await self._tick()
+                await asyncio.sleep(config.monitoring_interval)
+        except asyncio.CancelledError:
+            logger.info("Monitoring task cancelled")
+        finally:
+            self.is_running = False
+            logger.info("LP margin monitoring service stopped")
 
-
-    def stop_monitoring(self):
-        """Stop the monitoring service."""
-        self.is_running = False
-        logger.info("LP margin monitoring service stopped")
-
-    async def trigger_margin_report(self, lp_name: str, margin_level: float) -> None:
-        """Trigger LangGraph margin report generation for the specified LP."""
-        if margin_analysis_graph is None:
-            logger.error("Margin analysis graph is not available; skipping report generation.")
+    async def _tick(self) -> None:
+        accounts = await self.fetch_lp_data()
+        if not accounts:
+            logger.warning("No LP account data retrieved during monitoring tick")
             return
 
-        alert_message = (
-            f"MARGIN ALERT: {lp_name} has reached {margin_level:.2f}% margin utilization "
-            f"(threshold: {MARGIN_THRESHOLD:.2f}%). Generate immediate margin analysis and recommendations."
+        for account in accounts:
+            try:
+                await self._process_account(account)
+            except Exception as exc:  # noqa: BLE001
+                logger.exception(
+                    "Failed to process account", extra={"account": account, "error": str(exc)}
+                )
+
+        # cleanup resolved alerts periodically
+        state_manager.drop_resolved()
+
+    async def _process_account(self, account: Dict[str, Any]) -> None:
+        lp_name = account.get("LP", "Unknown")
+        margin_level = float(account.get("Margin Utilization %", 0.0))
+        now = datetime.now(timezone.utc)
+
+        if self._detect_blowup(account, margin_level):
+            if self._should_emit_blowup(lp_name, now):
+                trace_id = f"blowup_{lp_name.replace(' ', '_')}_{int(now.timestamp())}"
+                await orchestrator_client.trigger_margin_check(
+                    lp=lp_name,
+                    margin_level=margin_level,
+                    severity=AlertSeverity.EMERGENCY,
+                    trace_id=trace_id,
+                    occurred_at=now,
+                    payload={"accountSnapshot": account, "blowup": True},
+                    event_type="ACCOUNT_BLOWUP",
+                    message=f"URGENT: {lp_name} margin account is in liquidation risk.",
+                )
+                logger.critical(
+                    "Blowup detected for LP",
+                    extra={"lp": lp_name, "trace_id": trace_id, "margin": margin_level},
+                )
+            return
+
+        severity = config.determine_severity(margin_level)
+        existing_record = state_manager.get(lp_name)
+
+        if severity is None:
+            if existing_record and state_manager.hysteresis_cleared(existing_record, margin_level):
+                await self._handle_auto_clear(existing_record, margin_level, account, now)
+            elif existing_record:
+                existing_record.marginLevel = margin_level
+                existing_record.lastUpdatedAt = now
+            return
+
+        trace_id = (
+            existing_record.traceId
+            if existing_record and existing_record.severity == severity
+            else self._build_trace_id(lp_name, severity, now)
         )
 
-        intent_context = IntentContext(
-            intent="lp_margin_check_report",
-            confidence=1.0,
-            slots={"lp": lp_name},
-            traceId=f"alert_{lp_name}_{int(datetime.now().timestamp())}",
+        record = state_manager.upsert(
+            lp=lp_name,
+            severity=severity,
+            margin_level=margin_level,
+            trace_id=trace_id,
+            now=now,
         )
 
-        initial_state = {
-            "messages": [HumanMessage(content=alert_message)],
-            "intentContext": intent_context,
-        }
-
-        thread_id = f"margin_alert_{lp_name}_{uuid.uuid4().hex[:8]}"
-        config = {"configurable": {"thread_id": thread_id}}
-
-        result = await margin_analysis_graph.ainvoke(initial_state, config=config)
-
-        if "__interrupt__" in result and result["__interrupt__"]:
-            interrupt_info = result["__interrupt__"][0]
-            interrupt_value = getattr(interrupt_info, "value", interrupt_info)
-            logger.warning(
-                "Margin report generation for %s requires follow-up: %s",
-                lp_name,
-                interrupt_value,
+        if not state_manager.should_issue_alert(record, now):
+            logger.debug(
+                "Alert suppressed by pacing/ignore",
+                extra={"lp": lp_name, "trace_id": trace_id},
             )
             return
 
-        final_content = ""
-        if "messages" in result and result["messages"]:
-            final_message = result["messages"][-1]
-            final_content = getattr(final_message, "content", str(final_message))
+        logger.warning(
+            "[ALERT] %s margin %.2f%% (trace=%s, severity=%s) triggering orchestrator",
+            lp_name,
+            margin_level,
+            trace_id,
+            severity.value,
+        )
 
-        if final_content:
-            preview = final_content if len(final_content) < 500 else final_content[:500] + "..."
-            logger.info("📊 Margin report for %s (thread %s): %s", lp_name, thread_id, preview)
+        response = await orchestrator_client.trigger_margin_check(
+            lp=lp_name,
+            margin_level=margin_level,
+            severity=severity,
+            trace_id=trace_id,
+            occurred_at=now,
+            payload={"accountSnapshot": account},
+        )
+
+        record.mark_notified(now)
+        record.marginLevel = margin_level
+        record.lastUpdatedAt = now
+
+        response_type = response.get("type")
+        thread_id = response.get("thread_id")
+
+        # Log AI suggestion or card content for visibility
+        suggestion_text = None
+        if response_type == "complete":
+            suggestion_text = response.get("content")
+        elif response_type == "interrupt":
+            interrupt_payload = response.get("interrupt_data")
+            if isinstance(interrupt_payload, dict):
+                # Prefer structured report/card fields if available
+                for key in ("report", "card", "content"):
+                    if interrupt_payload.get(key):
+                        suggestion_text = interrupt_payload.get(key)
+                        break
+            if suggestion_text is None and interrupt_payload is not None:
+                suggestion_text = interrupt_payload
+
+        if suggestion_text:
+            try:
+                if not isinstance(suggestion_text, str):
+                    suggestion_text = json.dumps(
+                        suggestion_text, ensure_ascii=False
+                    )
+                preview_len = 800
+                trimmed = (
+                    suggestion_text
+                    if len(suggestion_text) <= preview_len
+                    else suggestion_text[:preview_len] + "..."
+                )
+                logger.info(
+                    "[ALERT][AI] Suggestions for %s (trace=%s): %s",
+                    lp_name,
+                    trace_id,
+                    trimmed,
+                )
+            except Exception as log_exc:  # noqa: BLE001
+                logger.debug(
+                    "Failed to serialize AI suggestion for logging: %s", log_exc
+                )
+
+        if response_type == "interrupt":
+            record.threadId = thread_id
+            record.mark_hitl()
+            logger.warning(
+                "[ALERT][HITL] Awaiting user approval for %s (trace=%s, thread=%s, severity=%s)",
+                lp_name,
+                trace_id,
+                thread_id,
+                record.severity.value,
+            )
+        elif response_type == "complete":
+            state_manager.resolve(lp_name)
+            logger.info(
+                "[ALERT][RESOLVED] %s resolved automatically (trace=%s)",
+                lp_name,
+                trace_id,
+            )
         else:
-            logger.info("Margin report for %s completed with no content (thread %s).", lp_name, thread_id)
+            logger.info(
+                "[ALERT] %s processed with response=%s (trace=%s)",
+                lp_name,
+                response_type,
+                trace_id,
+            )
+
+    async def _handle_auto_clear(
+        self,
+        record: AlertRecord,
+        margin_level: float,
+        account: Dict[str, Any],
+        now: datetime,
+    ) -> None:
+        logger.info(
+            "[ALERT][AUTO-CLEAR] %s margin %.2f%% (was %.2f%%) trace=%s",
+            record.lp,
+            margin_level,
+            record.marginLevel,
+            record.traceId,
+        )
+        await orchestrator_client.trigger_margin_check(
+            lp=record.lp,
+            margin_level=margin_level,
+            severity=record.severity,
+            trace_id=record.traceId,
+            occurred_at=now,
+            payload={
+                "accountSnapshot": account,
+                "autoCleared": True,
+            },
+            message=f"Monitoring update: {record.lp} margin level back to {margin_level:.2f}%.",
+        )
+        state_manager.resolve(record.lp, auto=True)
+
+    async def fetch_lp_data(self) -> List[Dict[str, Any]]:
+        """Fetch LP account data from Data Gateway."""
+        try:
+            if not self.api_client.access_token:
+                auth_result = self.api_client.authenticate()
+                if not auth_result.get("success"):
+                    logger.error("Authentication failed: %s", auth_result.get("error"))
+                    return []
+
+            accounts_result = self.api_client.get_lp_accounts()
+            if not isinstance(accounts_result, list):
+                return []
+            return accounts_result
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Error fetching LP data: %s", exc)
+            return []
+
+    def stop(self) -> None:
+        self.is_running = False
+
+    def _build_trace_id(
+        self, lp_name: str, severity: AlertSeverity, now: datetime
+    ) -> str:
+        epoch = int(now.timestamp())
+        sanitized_lp = lp_name.replace(" ", "_")
+        return f"monitor_{sanitized_lp}_{severity.value}_{epoch}"
+
+    def _detect_blowup(self, account: Dict[str, Any], margin_level: float) -> bool:
+        equity = float(account.get("Equity", 0.0))
+        margin_used = float(account.get("Margin", 0.0))
+        forced_liquidation = account.get("Forced Liquidation", 0)
+        if forced_liquidation:
+            return True
+        if margin_used <= 0:
+            return False
+        if equity <= margin_used:
+            return True
+        return margin_level <= config.blowup_margin_level
+
+    def _should_emit_blowup(self, lp: str, now: datetime) -> bool:
+        last = self._last_blowup.get(lp)
+        if last and (now - last).total_seconds() < config.blowup_suppression_seconds:
+            return False
+        self._last_blowup[lp] = now
+        return True
 
 
-# Global monitoring service instance
 monitoring_service = MonitoringService()
 
 
 @router.post("/start-monitoring")
-async def start_monitoring(background_tasks: BackgroundTasks):
+async def start_monitoring(background_tasks: BackgroundTasks) -> Dict[str, str]:
     """Start the LP margin monitoring service."""
-    if not monitoring_service.is_running:
-        background_tasks.add_task(monitoring_service.monitor_margins)
-        return {"status": "success", "message": "Monitoring service started"}
-    else:
+    if monitoring_service.is_running:
         return {"status": "info", "message": "Monitoring service already running"}
+    background_tasks.add_task(monitoring_service.monitor_margins)
+    return {"status": "success", "message": "Monitoring service started"}
 
 
 @router.post("/stop-monitoring")
-async def stop_monitoring():
-    """Stop the LP margin monitoring service."""
-    monitoring_service.stop_monitoring()
-    return {"status": "success", "message": "Monitoring service stopped"}
+async def stop_monitoring() -> Dict[str, str]:
+    """Stop the monitoring service."""
+    monitoring_service.stop()
+    return {"status": "success", "message": "Monitoring service stopping"}
 
 
 @router.get("/monitoring-status")
-async def get_monitoring_status():
-    """Get current monitoring service status."""
+async def get_monitoring_status() -> Dict[str, Any]:
+    """Get current monitoring service status and active alerts."""
     return {
         "status": "running" if monitoring_service.is_running else "stopped",
-        "threshold": MARGIN_THRESHOLD,
-        "interval": MONITORING_INTERVAL,
-        "last_alerts": {
-            lp: alert_time.isoformat() 
-            for lp, alert_time in monitoring_service.last_alerts.items()
+        "thresholds": {
+            severity.value: {
+                "trigger": config.thresholds[severity].trigger,
+                "clear": config.thresholds[severity].clear,
+            }
+            for severity in config.thresholds
+        },
+        "interval": config.monitoring_interval,
+        "blowupMarginLevel": config.blowup_margin_level,
+        "alerts": state_manager.serialize(),
+    }
+
+
+@router.post("/human-action")
+async def human_action(payload: HumanActionRequest) -> Dict[str, Any]:
+    """Receive human-in-the-loop actions from Chat UI cards."""
+    record = state_manager.get_by_trace(payload.traceId)
+    now = datetime.now(timezone.utc)
+
+    if not record:
+        raise HTTPException(status_code=404, detail="Alert trace not found")
+
+    record.reset_ignore_if_expired(now)
+
+    if payload.action is HumanAction.IGNORE:
+        ignore_until = payload.ignore_until(now)
+        if not ignore_until:
+            raise HTTPException(status_code=400, detail="ignoreMinutes is required")
+        record.mark_ignored(ignore_until)
+        record.lastUpdatedAt = now
+        logger.warning(
+            "[ALERT][IGNORED] %s suppressed until %s (trace=%s)",
+            record.lp,
+            ignore_until.isoformat(),
+            record.traceId,
+        )
+        return {
+            "status": "ignored",
+            "ignoreUntil": ignore_until.isoformat(),
         }
-    }
+
+    if payload.action is HumanAction.COMMENT:
+        logger.info(
+            "[ALERT][COMMENT] %s trace=%s note=%s",
+            record.lp,
+            record.traceId,
+            payload.message,
+        )
+        record.lastUpdatedAt = now
+        return {"status": "noted"}
+
+    # RECHECK
+    thread_id = payload.threadId or record.threadId
+    if not thread_id:
+        raise HTTPException(status_code=400, detail="threadId is required for recheck")
+
+    user_message = payload.message or "用户已处理，请复查保证金风险"
+
+    response = await orchestrator_client.resume_margin_check(
+        thread_id=thread_id,
+        user_input=user_message,
+    )
+
+    response_type = response.get("type")
+    if response_type == "complete":
+        record.mark_resolved(auto=False)
+        record.lastUpdatedAt = now
+        logger.info(
+            "[ALERT][RESOLVED] %s cleared after recheck (trace=%s, thread=%s)",
+            record.lp,
+            record.traceId,
+            thread_id,
+        )
+    elif response_type == "interrupt":
+        record.mark_hitl()
+        record.threadId = response.get("thread_id", thread_id)
+        record.lastUpdatedAt = now
+        logger.warning(
+            "[ALERT][HITL] Still pending after recheck for %s (trace=%s, thread=%s)",
+            record.lp,
+            record.traceId,
+            record.threadId,
+        )
+    else:
+        logger.info(
+            "[ALERT] Recheck response=%s for %s (trace=%s)",
+            response_type,
+            record.lp,
+            record.traceId,
+        )
+        record.lastUpdatedAt = now
+
+    return response
 
 
-@router.post("/test-alert")
-async def test_alert(lp_name: str = "TEST_LP", margin_level: float = 85.0):
-    """Test alert functionality by logging a test alert."""
-    logger.warning(f"🚨 TEST ALERT: {lp_name} margin level {margin_level:.2f}% exceeds threshold {MARGIN_THRESHOLD}%")
-    return {
-        "status": "success",
-        "message": f"Test alert logged for {lp_name}"
-    }
+@router.on_event("shutdown")
+async def shutdown_event() -> None:
+    await orchestrator_client.close()
