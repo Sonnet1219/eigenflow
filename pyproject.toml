@@ -1,0 +1,71 @@
+[project]
+name = "agent"
+version = "0.0.1"
+description = "Backend for the LangGraph agent"
+authors = [
+    { name = "zzxt", email = "zzxt@gmail.com" },
+]
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.11"
+dependencies = [
+    "langgraph",
+    "langchain",
+    "langchain-google-genai",
+    "langchain_openai",
+    "langgraph-checkpoint-postgres",
+    "langgraph-supervisor",
+    "python-dotenv>=1.0.1",
+    "langgraph-sdk>=0.1.57",
+    "langgraph-cli",
+    "langgraph-api",
+    "fastapi",
+    "uvicorn",
+    "python-multipart",
+    "supabase",
+    "pyalex>=0.18"
+]
+
+
+[project.optional-dependencies]
+dev = ["mypy>=1.11.1", "ruff>=0.6.1"]
+test = [
+    "pytest>=7.0.0",
+    "pytest-asyncio>=0.21.0", 
+    "pytest-env>=0.8.0",
+    "pytest-cov>=4.0.0"
+]
+
+[build-system]
+requires = ["setuptools>=73.0.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.ruff]
+lint.select = [
+    "E",    # pycodestyle
+    "F",    # pyflakes
+    "I",    # isort
+    "D",    # pydocstyle
+    "D401", # First line should be in imperative mood
+    "T201",
+    "UP",
+]
+lint.ignore = [
+    "UP006",
+    "UP007",
+    # We actually do want to import from typing_extensions
+    "UP035",
+    # Relax the convention by _not_ requiring documentation for every function parameter.
+    "D417",
+    "E501",
+]
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["D", "UP"]
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[dependency-groups]
+dev = [
+    "langgraph-cli[inmem]>=0.1.71",
+    "pytest>=8.3.5",
+]
