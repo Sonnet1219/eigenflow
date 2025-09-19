@@ -120,6 +120,7 @@ class AlertStateManager:
                 "firstTriggeredAt": rec.firstTriggeredAt.isoformat(),
                 "lastUpdatedAt": rec.lastUpdatedAt.isoformat(),
                 "ignoreUntil": rec.ignoreUntil.isoformat() if rec.ignoreUntil else "",
+                "latestReport": rec.latestReport or "",
             }
             for lp, rec in self._alerts.items()
         }

@@ -6,7 +6,7 @@ import asyncio
 import json
 import logging
 from datetime import datetime, timezone
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException
 
@@ -26,6 +26,46 @@ orchestrator_client = OrchestratorClient(
     config.orchestrator_base_url,
     timeout_seconds=config.orchestrator_timeout_seconds,
 )
+
+
+def _normalize_report_content(content: Any) -> Optional[str]:
+    """Convert structured report payloads to a string representation."""
+
+    if content is None:
+        return None
+    if isinstance(content, str):
+        return content
+    try:
+        return json.dumps(content, ensure_ascii=False)
+    except (TypeError, ValueError):  # Fallback to plain string conversion
+        return str(content)
+
+
+def _extract_report_text(response: Dict[str, Any]) -> Optional[str]:
+    """Derive the latest report text from orchestrator responses."""
+
+    response_type = response.get("type")
+    suggestion_text: Any = None
+
+    if response_type == "complete":
+        suggestion_text = response.get("content")
+    elif response_type == "interrupt":
+        interrupt_payload = response.get("interrupt_data")
+        if isinstance(interrupt_payload, dict):
+            for key in ("report", "card", "content"):
+                if interrupt_payload.get(key):
+                    suggestion_text = interrupt_payload.get(key)
+                    break
+        if suggestion_text is None and interrupt_payload is not None:
+            suggestion_text = interrupt_payload
+
+    if suggestion_text is None:
+        for fallback_key in ("content", "report", "message"):
+            if response.get(fallback_key):
+                suggestion_text = response.get(fallback_key)
+                break
+
+    return _normalize_report_content(suggestion_text)
 
 
 class MonitoringService:
@@ -157,42 +197,9 @@ class MonitoringService:
         thread_id = response.get("thread_id")
 
         # Log AI suggestion or card content for visibility
-        suggestion_text = None
-        if response_type == "complete":
-            suggestion_text = response.get("content")
-        elif response_type == "interrupt":
-            interrupt_payload = response.get("interrupt_data")
-            if isinstance(interrupt_payload, dict):
-                # Prefer structured report/card fields if available
-                for key in ("report", "card", "content"):
-                    if interrupt_payload.get(key):
-                        suggestion_text = interrupt_payload.get(key)
-                        break
-            if suggestion_text is None and interrupt_payload is not None:
-                suggestion_text = interrupt_payload
-
-        if suggestion_text:
-            try:
-                if not isinstance(suggestion_text, str):
-                    suggestion_text = json.dumps(
-                        suggestion_text, ensure_ascii=False
-                    )
-                preview_len = 800
-                trimmed = (
-                    suggestion_text
-                    if len(suggestion_text) <= preview_len
-                    else suggestion_text[:preview_len] + "..."
-                )
-                logger.info(
-                    "[ALERT][AI] Suggestions for %s (trace=%s): %s",
-                    lp_name,
-                    trace_id,
-                    trimmed,
-                )
-            except Exception as log_exc:  # noqa: BLE001
-                logger.debug(
-                    "Failed to serialize AI suggestion for logging: %s", log_exc
-                )
+        report_text = _extract_report_text(response)
+        if report_text:
+            record.latestReport = report_text
 
         if response_type == "interrupt":
             record.threadId = thread_id
@@ -380,6 +387,10 @@ async def human_action(payload: HumanActionRequest) -> Dict[str, Any]:
         thread_id=thread_id,
         user_input=user_message,
     )
+
+    report_text = _extract_report_text(response)
+    if report_text:
+        record.latestReport = report_text
 
     response_type = response.get("type")
     if response_type == "complete":

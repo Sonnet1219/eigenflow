@@ -62,6 +62,7 @@ class AlertRecord(BaseModel):
     notificationCount: int = 0
     ignoreUntil: Optional[datetime] = None
     lastUpdatedAt: datetime
+    latestReport: Optional[str] = None
 
     class Config:
         arbitrary_types_allowed = True
