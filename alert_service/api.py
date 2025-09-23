@@ -135,7 +135,9 @@ def _build_recheck_message(user_message: Optional[str]) -> str:
     """Construct instruction for recheck invocations."""
 
     instruction = (
-        "【复查请求】请立即基于最新保证金与持仓数据重新生成完整风险分析和操作建议，并在报告开头显式标注为'Recheck'结果。"
+        """[Recheck Request] Please immediately regenerate a complete risk analysis 
+        and operational recommendations based on the latest margin and position data, 
+        and explicitly label the report at the beginning as 'Recheck' result."""
     )
     if user_message:
         trimmed = user_message.strip()
@@ -158,7 +160,9 @@ def _strip_recheck_prompt(text: Optional[str]) -> Optional[str]:
 
     cleaned = RECHECK_PROMPT_PATTERN.sub("", text)
     cleaned = cleaned.replace(
-        "【复查请求】请立即基于最新保证金与持仓数据重新生成完整风险分析和操作建议，并在报告开头显式标注为'Recheck'结果。",
+         """[Recheck Request] Please immediately regenerate a complete risk analysis 
+        and operational recommendations based on the latest margin and position data, 
+        and explicitly label the report at the beginning as 'Recheck' result.""",
         "",
     )
     # Collapse duplicated blank lines introduced by removals

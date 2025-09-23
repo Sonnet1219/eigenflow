@@ -4,7 +4,7 @@ import logging
 from typing import Optional, List, Dict, Any, AsyncIterator
 from datetime import datetime
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from langchain_core.messages import HumanMessage
@@ -38,8 +38,13 @@ class MarginCheckResponse(BaseModel):
     thread_id: str = Field(description="Thread ID for this conversation")
 
 
-def _should_stream(request: Request) -> bool:
+def _should_stream(request: Request, stream_query: Optional[bool] = None) -> bool:
     """Determine whether the caller expects a streaming response."""
+    if stream_query is True:
+        return True
+    if stream_query is False:
+        return False
+
     stream_param = request.query_params.get("stream")
     if stream_param and stream_param.lower() in {"1", "true", "yes"}:
         return True
@@ -211,7 +216,14 @@ async def _stream_graph_response(
 
 
 @router.post("/margin-check")
-async def margin_check_endpoint(request: Request, body: EventInput):
+async def margin_check_endpoint(
+    request: Request,
+    body: EventInput,
+    stream: Optional[bool] = Query(
+        None,
+        description="Return response as Server-Sent Events stream",
+    ),
+):
     """Execute margin check analysis with human-in-the-loop approval."""
     try:
         graph = request.app.state.graph
@@ -219,7 +231,7 @@ async def margin_check_endpoint(request: Request, body: EventInput):
         # Check if this is a MARGIN_ALERT event - skip intent classification
         if body.eventType == "MARGIN_ALERT" and body.payload:
             # Create alert message for direct processing
-            lp_name = body.payload.get("lp", "Unknown")
+            lp_name = body.payload.get("lp", "All")
             margin_level = body.payload.get("marginLevel", 0) * 100  # Convert to percentage
             threshold = body.payload.get("threshold", 0.8) * 100
             
@@ -238,6 +250,7 @@ async def margin_check_endpoint(request: Request, body: EventInput):
             initial_state = {
                 "messages": messages,
                 "intentContext": intent_context,
+                # 如果是alert就不需要意图识别 直接生成报告
                 "skipIntentClassification": True
             }
         else:
@@ -250,7 +263,8 @@ async def margin_check_endpoint(request: Request, body: EventInput):
                         messages.append(HumanMessage(content=msg.get("content", "")))
             else:
                 # Default margin check request
-                messages = [HumanMessage(content="请生成当前LP账户的保证金水平报告和建议")]
+                human_content = "Generate a report on the current margin levels of LP accounts and provide recommendations."
+                messages = [HumanMessage(content=human_content)]
             
             initial_state = {
                 "messages": messages
@@ -260,15 +274,15 @@ async def margin_check_endpoint(request: Request, body: EventInput):
         thread_id = body.thread_id or f"margin_check_{hash(str(messages))}"
         config = {"configurable": {"thread_id": thread_id}}
 
-        if _should_stream(request):
-            stream = _stream_graph_response(
+        if _should_stream(request, stream):
+            stream_iterator = _stream_graph_response(
                 graph,
                 initial_state,
                 config,
                 thread_id=thread_id,
                 completion_status="complete",
             )
-            return StreamingResponse(stream, media_type="text/event-stream")
+            return StreamingResponse(stream_iterator, media_type="text/event-stream")
 
         try:
             logger.info(f"Invoking graph with initial_state: {initial_state}")
@@ -291,7 +305,14 @@ async def margin_check_endpoint(request: Request, body: EventInput):
 
 
 @router.post("/margin-check/recheck")
-async def margin_recheck_endpoint(request: Request, body: EventInput):
+async def margin_recheck_endpoint(
+    request: Request,
+    body: EventInput,
+    stream: Optional[bool] = Query(
+        None,
+        description="Return response as Server-Sent Events stream",
+    ),
+):
     """Resume margin check conversation after human approval."""
     try:
         graph = request.app.state.graph
@@ -312,15 +333,15 @@ async def margin_recheck_endpoint(request: Request, body: EventInput):
         
         initial_state = Command(resume=user_input)
 
-        if _should_stream(request):
-            stream = _stream_graph_response(
+        if _should_stream(request, stream):
+            stream_iterator = _stream_graph_response(
                 graph,
                 initial_state,
                 config,
                 thread_id=body.thread_id,
                 completion_status="completed",
             )
-            return StreamingResponse(stream, media_type="text/event-stream")
+            return StreamingResponse(stream_iterator, media_type="text/event-stream")
 
         try:
             result = await graph.ainvoke(initial_state, config=config)
