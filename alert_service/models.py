@@ -16,6 +16,7 @@ class AlertStatus(str, Enum):
 
     ACTIVE = "active"  # triggered and awaiting processing
     AWAITING_HITL = "awaiting_hitl"
+    RECHECK_PENDING = "recheck_pending"
     IGNORED = "ignored"
     RESOLVED = "resolved"
     AUTO_CLEARED = "auto_cleared"
@@ -92,6 +93,9 @@ class AlertRecord(BaseModel):
 
     def mark_hitl(self) -> None:
         self.status = AlertStatus.AWAITING_HITL
+
+    def mark_recheck_pending(self) -> None:
+        self.status = AlertStatus.RECHECK_PENDING
 
     def reset_ignore_if_expired(self, now: datetime) -> None:
         if self.ignoreUntil and now >= self.ignoreUntil:

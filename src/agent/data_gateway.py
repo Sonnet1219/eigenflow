@@ -71,6 +71,8 @@ class EigenFlowAPI:
                 "broker": broker  # Use the pre-hashed broker value directly
             }
             
+
+
             response = requests.post(AUTH_ENDPOINT, json=auth_data, headers=self.headers, timeout=CONFIG['API_TIMEOUT_SECONDS'])
             
             if response.status_code == 200:

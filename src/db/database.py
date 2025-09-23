@@ -201,6 +201,40 @@ class DatabaseManager:
             raise
 
     @classmethod
+    async def force_reconnect(
+        cls, *, max_retries: int = 3, base_delay: float = 0.5
+    ) -> None:
+        """Forcefully recycle the async connection pool after fatal errors."""
+
+        if cls._async_pool is None:
+            logger.warning(
+                "Force reconnect requested but pool is not initialized; initializing now"
+            )
+            await cls.initialize()
+            return
+
+        last_error: Optional[BaseException] = None
+
+        for attempt in range(1, max_retries + 1):
+            try:
+                await cls._async_pool.close()
+                await cls._async_pool.open()
+                cls._last_health_check = datetime.now()
+                logger.info(
+                    "Async database connection pool force reconnected (attempt %d)",
+                    attempt,
+                )
+                return
+            except Exception as exc:  # noqa: BLE001
+                last_error = exc
+                logger.warning(
+                    "Force reconnect attempt %d failed: %s", attempt, exc
+                )
+                await asyncio.sleep(min(base_delay * attempt, 2.0))
+
+        raise RuntimeError("Failed to force reconnect async database connection pool") from last_error
+
+    @classmethod
     async def get_pool(cls, max_retries: int = 3) -> AsyncConnectionPool:
         """
         Get the async database connection pool, with retry mechanism

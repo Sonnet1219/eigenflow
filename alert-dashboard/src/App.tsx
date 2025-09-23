@@ -1,6 +1,65 @@
 import { useEffect, useMemo, useState } from "react";
 import "./App.css";
 
+type SSECallback = (event: string, payload: unknown) => void;
+
+async function consumeSSE(
+  response: Response,
+  onEvent: SSECallback
+): Promise<void> {
+  if (!response.body) {
+    throw new Error("SSE response has no body");
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  const processBlock = (block: string) => {
+    if (!block.trim()) return;
+    let eventName = "message";
+    const dataLines: string[] = [];
+    for (const line of block.split("\n")) {
+      if (line.startsWith("event:")) {
+        eventName = line.slice(6).trim() || "message";
+      } else if (line.startsWith("data:")) {
+        dataLines.push(line.slice(5).trim());
+      }
+    }
+    const rawData = dataLines.join("\n");
+    let payload: unknown = rawData;
+    if (!rawData.length) {
+      payload = {};
+    } else {
+      try {
+        payload = JSON.parse(rawData);
+      } catch {
+        payload = rawData;
+      }
+    }
+    onEvent(eventName, payload);
+  };
+
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) {
+      buffer += decoder.decode();
+      break;
+    }
+    buffer += decoder.decode(value, { stream: true });
+    let boundary: number;
+    while ((boundary = buffer.indexOf("\n\n")) !== -1) {
+      const block = buffer.slice(0, boundary);
+      buffer = buffer.slice(boundary + 2);
+      processBlock(block);
+    }
+  }
+
+  if (buffer.length) {
+    processBlock(buffer);
+  }
+}
+
 type Severity = "warn" | "critical" | "emergency";
 
 type AlertRow = {
@@ -30,6 +89,15 @@ const API_ROOT = import.meta.env.VITE_ALERT_API_ROOT || "http://0.0.0.0:8002";
 const STATUS_POLL_INTERVAL = 30_000;
 const LOG_LIMIT = 25;
 
+const STATUS_LABELS: Record<string, string> = {
+  active: "active",
+  awaiting_hitl: "awaiting HITL",
+  recheck_pending: "rechecked – still high",
+  ignored: "ignored",
+  resolved: "resolved",
+  auto_cleared: "auto-cleared",
+};
+
 function stringifyError(err: unknown): string {
   if (err instanceof Error) return err.message;
   return typeof err === "string" ? err : JSON.stringify(err);
@@ -44,6 +112,10 @@ function App() {
   const [controlLoading, setControlLoading] = useState<boolean>(false);
   const [logs, setLogs] = useState<string[]>([]);
   const [autoRefresh, setAutoRefresh] = useState<boolean>(true);
+  const [streamingTrace, setStreamingTrace] = useState<string | null>(null);
+  const [streamingReport, setStreamingReport] = useState<string>("");
+  const [historyContent, setHistoryContent] = useState<string | null>(null);
+  const [historyLoading, setHistoryLoading] = useState<boolean>(false);
 
   const alerts = useMemo(() => {
     if (!data) return [] as AlertRow[];
@@ -56,6 +128,10 @@ function App() {
     () => alerts.find((alert) => alert.traceId === selectedTrace),
     [alerts, selectedTrace]
   );
+
+  useEffect(() => {
+    setHistoryContent(null);
+  }, [selectedTrace]);
 
   const appendLog = (label: string, payload: unknown) => {
     setLogs((prev) => [
@@ -134,6 +210,61 @@ function App() {
         payload.ignoreMinutes = ignoreMinutes;
       }
 
+      if (action === "recheck") {
+        setStreamingTrace(selectedAlert.traceId);
+        setStreamingReport("");
+        setHistoryContent(null);
+        const res = await fetch(`${API_ROOT}/alert/human-action?stream=true`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Accept: "text/event-stream",
+          },
+          body: JSON.stringify(payload),
+        });
+
+        if (!res.ok) {
+          throw new Error(`Status ${res.status}`);
+        }
+
+        await consumeSSE(res, (event, rawPayload) => {
+          appendLog(`human-action:recheck:${event}`, rawPayload);
+          if (event === "status") {
+            setStreamingReport("Recheck in progress...");
+            return;
+          }
+
+          if (event === "delta") {
+            const delta =
+              typeof rawPayload === "object" && rawPayload && "delta" in rawPayload
+                ? (rawPayload as Record<string, unknown>).delta
+                : rawPayload;
+            if (typeof delta === "string") {
+              setStreamingReport((prev) => `${prev}${delta}`);
+            }
+            return;
+          }
+
+          if (event === "final") {
+            if (
+              typeof rawPayload === "object" &&
+              rawPayload &&
+              "content" in rawPayload &&
+              typeof (rawPayload as Record<string, unknown>).content === "string"
+            ) {
+              setStreamingReport(
+                (rawPayload as Record<string, unknown>).content as string
+              );
+            } else {
+              setStreamingReport(JSON.stringify(rawPayload, null, 2));
+            }
+          }
+        });
+
+        setMessage("");
+        return;
+      }
+
       const res = await fetch(`${API_ROOT}/alert/human-action`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -141,12 +272,38 @@ function App() {
       });
       const json = await res.json();
       appendLog(`human-action:${action}`, json);
-      setMessage((prev) => (action === "comment" ? "" : prev));
+      if (action !== "comment") {
+        setMessage("");
+      }
     } catch (err) {
       appendLog(`human-action:${action} error`, stringifyError(err));
     } finally {
       setLoading(false);
-      fetchStatus();
+      await fetchStatus();
+      if (action === "recheck") {
+        setStreamingTrace(null);
+      }
+    }
+  };
+
+  const fetchHistory = async () => {
+    if (!selectedAlert) return;
+    try {
+      setHistoryLoading(true);
+      const res = await fetch(
+        `${API_ROOT}/alert/history/${encodeURIComponent(selectedAlert.traceId)}`
+      );
+      if (!res.ok) {
+        throw new Error(`Status ${res.status}`);
+      }
+      const json = await res.json();
+      appendLog("history", json);
+      setHistoryContent(JSON.stringify(json.history, null, 2));
+    } catch (err) {
+      appendLog("history error", stringifyError(err));
+      setHistoryContent(stringifyError(err));
+    } finally {
+      setHistoryLoading(false);
     }
   };
 
@@ -228,7 +385,7 @@ function App() {
                         {alert.severity}
                       </td>
                       <td>{alert.marginLevel}</td>
-                      <td>{alert.status}</td>
+                      <td>{STATUS_LABELS[alert.status] ?? alert.status}</td>
                       <td className="mono">{alert.traceId}</td>
                       <td className="mono">
                         {alert.threadId ? alert.threadId : "—"}
@@ -268,6 +425,11 @@ function App() {
           </div>
           {selectedAlert ? (
             <div className="form">
+              {selectedAlert.status === "recheck_pending" ? (
+                <div className="status-note">
+                  已复查，但风险阈值仍然偏高。请进一步人工跟进。
+                </div>
+              ) : null}
               <label>
                 Message
                 <textarea
@@ -317,19 +479,32 @@ function App() {
             {selectedAlert ? (
               <span className="panel__meta">
                 Updated: {new Date(selectedAlert.lastUpdatedAt).toLocaleString()}
+                {" "}
+                <button
+                  className="link-button"
+                  disabled={!selectedAlert.threadId || historyLoading}
+                  onClick={fetchHistory}
+                >
+                  History
+                </button>
               </span>
             ) : (
               <span className="panel__meta">Select an alert to view report.</span>
             )}
           </div>
           {selectedAlert ? (
-            selectedAlert.latestReport ? (
+            streamingTrace === selectedAlert.traceId ? (
+              <pre className="report-view streaming">{streamingReport}</pre>
+            ) : selectedAlert.latestReport ? (
               <pre className="report-view">{selectedAlert.latestReport}</pre>
             ) : (
               <p className="placeholder">No report captured yet.</p>
             )
           ) : (
             <p className="placeholder">Select an alert row to display its report.</p>
+          )}
+          {selectedAlert && historyContent && (
+            <pre className="history-view">{historyContent}</pre>
           )}
         </div>
         <div className="panel">

@@ -1,7 +1,7 @@
 """API endpoints for chat operations using multi-agent supervisor."""
 
 import logging
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, AsyncIterator
 from datetime import datetime
 
 from fastapi import APIRouter, HTTPException, Request
@@ -38,6 +38,178 @@ class MarginCheckResponse(BaseModel):
     thread_id: str = Field(description="Thread ID for this conversation")
 
 
+def _should_stream(request: Request) -> bool:
+    """Determine whether the caller expects a streaming response."""
+    stream_param = request.query_params.get("stream")
+    if stream_param and stream_param.lower() in {"1", "true", "yes"}:
+        return True
+
+    accept_header = request.headers.get("accept", "")
+    return "text/event-stream" in accept_header.lower()
+
+
+def _format_sse(payload: Dict[str, Any], event: str | None = None) -> str:
+    """Serialize payload into Server-Sent Events format."""
+    data = json.dumps(payload, ensure_ascii=False)
+    if event:
+        return f"event: {event}\ndata: {data}\n\n"
+    return f"data: {data}\n\n"
+
+
+def _extract_chunk_text(chunk: Any) -> str:
+    """Best-effort extraction of textual content from LangGraph stream chunks."""
+    if chunk is None:
+        return ""
+
+    content = getattr(chunk, "content", None)
+    if isinstance(content, str):
+        return content
+    if content:
+        return str(content)
+
+    if isinstance(chunk, dict):
+        for key in ("delta", "text", "message", "output", "chunk"):
+            value = chunk.get(key)
+            if isinstance(value, str):
+                return value
+            if value:
+                return str(value)
+        if "messages" in chunk and chunk["messages"]:
+            return ", ".join(str(item) for item in chunk["messages"] if item)
+
+    return str(chunk)
+
+
+def _coerce_report_text(value: Any) -> str:
+    """Normalize mixed report payloads into a printable string."""
+    if value is None:
+        return ""
+
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped.lower().startswith("successfully transferred to "):
+            return ""
+        return stripped
+
+    if isinstance(value, (dict, list)):
+        try:
+            text = json.dumps(value, ensure_ascii=False, indent=2)
+        except (TypeError, ValueError):
+            text = str(value)
+        return text.strip()
+
+    return str(value).strip()
+
+
+def _prepare_graph_result(result: Dict[str, Any], thread_id: str, *, completion_status: str) -> Dict[str, Any]:
+    """Normalize LangGraph output into legacy response schema."""
+    latest_report = _coerce_report_text(result.get("latestReport"))
+
+    if "__interrupt__" in result:
+        interrupt_info = result["__interrupt__"][0] if result["__interrupt__"] else None
+        interrupt_payload = None
+        if interrupt_info is not None:
+            interrupt_payload = getattr(interrupt_info, "value", interrupt_info)
+            if isinstance(interrupt_payload, dict):
+                if not interrupt_payload.get("report") and latest_report:
+                    interrupt_payload = {**interrupt_payload, "report": latest_report}
+        final_content = latest_report or ""
+        if not final_content and isinstance(interrupt_payload, dict):
+            final_content = _coerce_report_text(
+                interrupt_payload.get("report") or interrupt_payload.get("content"),
+            )
+        if not final_content and result.get("messages"):
+            last_msg = result["messages"][-1]
+            final_content = _coerce_report_text(getattr(last_msg, "content", ""))
+        return {
+            "type": "interrupt",
+            "status": "awaiting_approval",
+            "interrupt_data": interrupt_payload,
+            "thread_id": thread_id,
+            "content": final_content,
+            "report": final_content
+        }
+
+    final_content = ""
+    if result.get("messages"):
+        last_msg = result["messages"][-1]
+        final_content = _coerce_report_text(getattr(last_msg, "content", ""))
+
+    if latest_report:
+        final_content = latest_report
+
+    return {
+        "type": "complete",
+        "status": completion_status,
+        "content": final_content,
+        "report": final_content,
+        "thread_id": thread_id
+    }
+
+
+async def _stream_graph_response(
+    graph,
+    initial_state: Any,
+    config: Dict[str, Any],
+    *,
+    thread_id: str,
+    completion_status: str,
+) -> AsyncIterator[str]:
+    """Yield SSE payloads while the graph executes."""
+    yield _format_sse({"status": "started", "thread_id": thread_id}, event="status")
+
+    final_output: Optional[Dict[str, Any]] = None
+
+    try:
+        async for event in graph.astream_events(initial_state, config=config, version="v2"):
+            event_type = event.get("event")
+            name = event.get("name")
+
+            if event_type == "on_chain_start" and name and name != "LangGraph":
+                yield _format_sse(
+                    {"status": "node_start", "node": name, "thread_id": thread_id},
+                    event="status",
+                )
+                continue
+
+            if event_type == "on_chat_model_stream":
+                chunk = event.get("data", {}).get("chunk")
+                text = _extract_chunk_text(chunk)
+                if text:
+                    yield _format_sse(
+                        {"delta": text, "node": name, "thread_id": thread_id},
+                        event="delta",
+                    )
+                continue
+
+            if event_type == "on_chain_stream" and name == "LangGraph":
+                chunk = event.get("data", {}).get("chunk")
+                if chunk:
+                    yield _format_sse(
+                        {"progress": str(chunk), "thread_id": thread_id},
+                        event="progress",
+                    )
+                continue
+
+            if event_type == "on_chain_end" and name == "LangGraph":
+                final_output = event.get("data", {}).get("output")
+
+    except Exception as exc:  # noqa: BLE001
+        logger.error("Graph streaming error: %s", exc, exc_info=True)
+        yield _format_sse({"message": str(exc), "thread_id": thread_id}, event="error")
+        return
+
+    if final_output is None:
+        yield _format_sse(
+            {"message": "No output generated", "thread_id": thread_id},
+            event="error",
+        )
+        return
+
+    final_payload = _prepare_graph_result(final_output, thread_id, completion_status=completion_status)
+    yield _format_sse(final_payload, event="final")
+
+
 @router.post("/margin-check")
 async def margin_check_endpoint(request: Request, body: EventInput):
     """Execute margin check analysis with human-in-the-loop approval."""
@@ -65,7 +237,8 @@ async def margin_check_endpoint(request: Request, body: EventInput):
             
             initial_state = {
                 "messages": messages,
-                "intentContext": intent_context
+                "intentContext": intent_context,
+                "skipIntentClassification": True
             }
         else:
             # Regular message processing
@@ -86,37 +259,22 @@ async def margin_check_endpoint(request: Request, body: EventInput):
         # Use provided thread_id or generate new one
         thread_id = body.thread_id or f"margin_check_{hash(str(messages))}"
         config = {"configurable": {"thread_id": thread_id}}
-        
-        # Use ainvoke for simpler implementation
+
+        if _should_stream(request):
+            stream = _stream_graph_response(
+                graph,
+                initial_state,
+                config,
+                thread_id=thread_id,
+                completion_status="complete",
+            )
+            return StreamingResponse(stream, media_type="text/event-stream")
+
         try:
             logger.info(f"Invoking graph with initial_state: {initial_state}")
             result = await graph.ainvoke(initial_state, config=config)
-            
-            # Check if there's an interrupt
-            if "__interrupt__" in result:
-                interrupt_info = result["__interrupt__"][0] if result["__interrupt__"] else None
-                
-                response = {
-                    "type": "interrupt",
-                    "status": "awaiting_approval",
-                    "interrupt_data": interrupt_info.value if interrupt_info else None,
-                    "thread_id": thread_id
-                }
-                return response
-            
-            # Extract final message content
-            final_content = ""
-            if "messages" in result and result["messages"]:
-                final_content = result["messages"][-1].content if hasattr(result["messages"][-1], 'content') else ""
-            
-            response = {
-                "type": "complete",
-                "status": "completed",
-                "content": final_content,
-                "thread_id": thread_id
-            }
-            return response
-            
+            return _prepare_graph_result(result, thread_id, completion_status="complete")
+
         except Exception as e:
             logger.error(f"Error in graph execution: {e}")
             return {
@@ -152,35 +310,22 @@ async def margin_recheck_endpoint(request: Request, body: EventInput):
                     user_input = msg.get("content", "")
                     break
         
-        # Use ainvoke for simpler implementation
+        initial_state = Command(resume=user_input)
+
+        if _should_stream(request):
+            stream = _stream_graph_response(
+                graph,
+                initial_state,
+                config,
+                thread_id=body.thread_id,
+                completion_status="completed",
+            )
+            return StreamingResponse(stream, media_type="text/event-stream")
+
         try:
-            result = await graph.ainvoke(Command(resume=user_input), config=config)
-            
-            # Check if there's an interrupt
-            if "__interrupt__" in result:
-                interrupt_info = result["__interrupt__"][0] if result["__interrupt__"] else None
-                
-                response = {
-                    "type": "interrupt",
-                    "status": "awaiting_approval",
-                    "interrupt_data": interrupt_info.value if interrupt_info else None,
-                    "thread_id": body.thread_id
-                }
-                return response
-            
-            # Extract final message content
-            final_content = ""
-            if "messages" in result and result["messages"]:
-                final_content = result["messages"][-1].content if hasattr(result["messages"][-1], 'content') else ""
-            
-            response = {
-                "type": "complete",
-                "status": "completed",
-                "content": final_content,
-                "thread_id": body.thread_id
-            }
-            return response
-            
+            result = await graph.ainvoke(initial_state, config=config)
+            return _prepare_graph_result(result, body.thread_id, completion_status="completed")
+
         except Exception as e:
             logger.error(f"Error in recheck execution: {e}")
             return {

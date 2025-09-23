@@ -48,16 +48,16 @@ class MonitoringConfig:
     thresholds: Dict[AlertSeverity, Threshold] = field(
         default_factory=lambda: {
             AlertSeverity.WARN: Threshold(
-                trigger=float(os.getenv("ALERT_WARN_TRIGGER", "30")),
-                clear=float(os.getenv("ALERT_WARN_CLEAR", "25")),
+                trigger=float(os.getenv("ALERT_WARN_TRIGGER", "15")),
+                clear=float(os.getenv("ALERT_WARN_CLEAR", "10")),
             ),
             AlertSeverity.CRITICAL: Threshold(
                 trigger=float(os.getenv("ALERT_CRITICAL_TRIGGER", "25")),
                 clear=float(os.getenv("ALERT_CRITICAL_CLEAR", "20")),
             ),
             AlertSeverity.EMERGENCY: Threshold(
-                trigger=float(os.getenv("ALERT_EMERGENCY_TRIGGER", "20")),
-                clear=float(os.getenv("ALERT_EMERGENCY_CLEAR", "15")),
+                trigger=float(os.getenv("ALERT_EMERGENCY_TRIGGER", "35")),
+                clear=float(os.getenv("ALERT_EMERGENCY_CLEAR", "30")),
             ),
         }
     )
@@ -68,9 +68,12 @@ class MonitoringConfig:
     blowup_suppression_seconds: int = field(
         default_factory=lambda: int(os.getenv("ALERT_BLOWUP_SUPPRESS", "300"))
     )
+    max_concurrent_accounts: int = field(
+        default_factory=lambda: int(os.getenv("ALERT_MAX_CONCURRENT_ACCOUNTS", "3"))
+    )
 
     def determine_severity(self, margin_level: float) -> AlertSeverity | None:
-        """Return highest severity whose trigger is satisfied."""
+        """Return highest severity whose trigger is satisfied (higher margin levels imply higher risk)."""
 
         for severity in (AlertSeverity.EMERGENCY, AlertSeverity.CRITICAL, AlertSeverity.WARN):
             threshold = self.thresholds[severity]
@@ -79,7 +82,7 @@ class MonitoringConfig:
         return None
 
     def should_auto_clear(self, severity: AlertSeverity, margin_level: float) -> bool:
-        """Check if margin level has fallen below the clear threshold."""
+        """Check if margin level has fallen back below the clear threshold."""
 
         threshold = self.thresholds[severity]
         return margin_level <= threshold.clear

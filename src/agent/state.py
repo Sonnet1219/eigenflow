@@ -12,6 +12,9 @@ class OverallState(TypedDict, total=False):
     """Main graph state managing overall workflow with enhanced intent classification."""
     messages: Annotated[list[AnyMessage], add_messages]
     intentContext: Optional[IntentContext]  # Enhanced intent context with full classification details
+    last_resume_message: Optional[str]
+    latestReport: Optional[str]
+    skipIntentClassification: Optional[bool]
     # clarificationAttempts: Optional[int]  # Track how many clarification loops have been attempted
 
 

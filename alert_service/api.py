@@ -5,13 +5,20 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, AsyncIterator
 
-from fastapi import APIRouter, BackgroundTasks, HTTPException
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
+from fastapi.responses import StreamingResponse
 
 from alert_service.config import AlertSeverity, MonitoringConfig
-from alert_service.models import AlertRecord, HumanAction, HumanActionRequest
+from alert_service.models import (
+    AlertRecord,
+    AlertStatus,
+    HumanAction,
+    HumanActionRequest,
+)
 from alert_service.orchestrator_client import OrchestratorClient
 from alert_service.state_manager import AlertStateManager
 from src.agent.data_gateway import EigenFlowAPI
@@ -41,7 +48,45 @@ def _normalize_report_content(content: Any) -> Optional[str]:
         return str(content)
 
 
-def _extract_report_text(response: Dict[str, Any]) -> Optional[str]:
+def _find_report_candidate(payload: Any) -> Optional[Any]:
+    """Heuristically locate the most relevant report-like content in a payload."""
+    
+    if payload is None:
+        return None
+    if isinstance(payload, str):
+        return payload
+    if isinstance(payload, dict):
+        for key in (
+            "report",
+            "card",
+            "content",
+            "body",
+            "details",
+            "message",
+            "data",
+        ):
+            if key in payload:
+                candidate = _find_report_candidate(payload[key])
+                if candidate:
+                    return candidate
+        # Fallback to first string value
+        for value in payload.values():
+            candidate = _find_report_candidate(value)
+            if candidate:
+                return candidate
+    if isinstance(payload, (list, tuple)):
+        for item in payload:
+            candidate = _find_report_candidate(item)
+            if candidate:
+                return candidate
+    return None
+
+
+def _extract_report_text(
+    response: Dict[str, Any],
+    *,
+    exclude: Optional[set[str]] = None,
+) -> Optional[str]:
     """Derive the latest report text from orchestrator responses."""
 
     response_type = response.get("type")
@@ -51,21 +96,156 @@ def _extract_report_text(response: Dict[str, Any]) -> Optional[str]:
         suggestion_text = response.get("content")
     elif response_type == "interrupt":
         interrupt_payload = response.get("interrupt_data")
-        if isinstance(interrupt_payload, dict):
-            for key in ("report", "card", "content"):
-                if interrupt_payload.get(key):
-                    suggestion_text = interrupt_payload.get(key)
-                    break
-        if suggestion_text is None and interrupt_payload is not None:
-            suggestion_text = interrupt_payload
+        suggestion_text = _find_report_candidate(interrupt_payload)
 
     if suggestion_text is None:
-        for fallback_key in ("content", "report", "message"):
-            if response.get(fallback_key):
-                suggestion_text = response.get(fallback_key)
-                break
+        suggestion_text = _find_report_candidate(response)
 
-    return _normalize_report_content(suggestion_text)
+    normalized = _normalize_report_content(suggestion_text)
+    if not normalized:
+        return None
+
+    comparison_pool = {text.strip() for text in (exclude or set()) if text}
+    if normalized.strip() in comparison_pool:
+        return None
+    return normalized
+
+
+def _wants_stream(request: Request) -> bool:
+    """Check whether the caller expects server-sent events."""
+
+    stream_param = request.query_params.get("stream")
+    if stream_param and stream_param.lower() in {"1", "true", "yes"}:
+        return True
+
+    accept = request.headers.get("accept", "")
+    return "text/event-stream" in accept.lower()
+
+
+def _format_sse(payload: Dict[str, Any], event: str | None = None) -> str:
+    """Serialize payload for SSE response."""
+
+    data = json.dumps(payload, ensure_ascii=False)
+    if event:
+        return f"event: {event}\ndata: {data}\n\n"
+    return f"data: {data}\n\n"
+
+
+def _build_recheck_message(user_message: Optional[str]) -> str:
+    """Construct instruction for recheck invocations."""
+
+    instruction = (
+        "【复查请求】请立即基于最新保证金与持仓数据重新生成完整风险分析和操作建议，并在报告开头显式标注为'Recheck'结果。"
+    )
+    if user_message:
+        trimmed = user_message.strip()
+        if trimmed:
+            return f"{trimmed}\n{instruction}"
+    return instruction
+
+
+RECHECK_PROMPT_PATTERN = re.compile(
+    r"\{[^{}]*\"action\"\s*:\s*\"recheck\"[^{}]*\}\s*",
+    re.IGNORECASE,
+)
+
+
+def _strip_recheck_prompt(text: Optional[str]) -> Optional[str]:
+    """Remove prompt scaffolding and HITL metadata from stored reports."""
+
+    if not text:
+        return text
+
+    cleaned = RECHECK_PROMPT_PATTERN.sub("", text)
+    cleaned = cleaned.replace(
+        "【复查请求】请立即基于最新保证金与持仓数据重新生成完整风险分析和操作建议，并在报告开头显式标注为'Recheck'结果。",
+        "",
+    )
+    # Collapse duplicated blank lines introduced by removals
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
+
+
+def _annotate_recheck_report(report: Optional[str], *, occurred_at: datetime) -> Optional[str]:
+    """Ensure recheck reports carry explicit annotation."""
+
+    if not report:
+        return None
+
+    header = f"[RECHECK][{occurred_at.isoformat()}]"
+    if header in report:
+        return report
+    if report.startswith("[RECHECK]"):
+        return report
+    return f"{header}\n{report}"
+
+
+def _apply_recheck_outcome(
+    record: AlertRecord,
+    response: Dict[str, Any],
+    *,
+    now: datetime,
+    note_recheck: bool = False,
+) -> None:
+    """Update alert record based on orchestrator response."""
+
+    response_type = response.get("type")
+    thread_id = response.get("thread_id")
+    if thread_id:
+        record.threadId = thread_id
+
+    content = response.get("content")
+    if note_recheck:
+        content = _annotate_recheck_report(content, occurred_at=now) or content
+    content = _strip_recheck_prompt(content)
+    if content:
+        record.latestReport = content
+
+    if response_type == "complete":
+        summary = (content or "").upper()
+        if summary and ("CRITICAL" in summary or "高风险" in summary or "危机" in summary):
+            record.mark_recheck_pending()
+        elif summary:
+            record.mark_resolved(auto=False)
+        else:
+            record.mark_recheck_pending()
+    elif response_type == "interrupt":
+        record.mark_recheck_pending()
+
+    record.lastUpdatedAt = now
+
+
+async def _fetch_report_from_history(thread_id: str, *, exclude: Optional[set[str]] = None) -> Optional[str]:
+    """Fetch the latest assistant message from orchestrator history as a fallback report."""
+
+    try:
+        history = await orchestrator_client.fetch_history(thread_id)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Failed to fetch history for report enrichment: %s", exc)
+        return None
+
+    execution = history.get("execution_history") or []
+    for step in reversed(execution):
+        messages = step.get("values", {}).get("messages", [])
+        for message in reversed(messages):
+            candidate: Optional[str] = None
+            if isinstance(message, dict):
+                msg_type = message.get("type") or message.get("role")
+                if msg_type in {"ai", "assistant", "tool"}:
+                    parsed = message.get("parsed_content")
+                    candidate = _normalize_report_content(parsed) if parsed else _normalize_report_content(message.get("content"))
+            elif isinstance(message, str):
+                candidate = message
+
+            if not candidate:
+                continue
+
+            comparison_pool = {text.strip() for text in (exclude or set()) if text}
+            if candidate.strip() in comparison_pool:
+                continue
+            return candidate
+
+    return None
 
 
 class MonitoringService:
@@ -180,13 +360,22 @@ class MonitoringService:
             severity.value,
         )
 
+        default_prompt = (
+            f"Monitoring alert: {lp_name} margin level {margin_level:.2f}% "
+            f"meets {severity.value} threshold."
+        )
+
         response = await orchestrator_client.trigger_margin_check(
             lp=lp_name,
             margin_level=margin_level,
             severity=severity,
             trace_id=trace_id,
             occurred_at=now,
-            payload={"accountSnapshot": account},
+            payload={
+                "accountSnapshot": account,
+                "threshold": config.thresholds[severity].trigger / 100,
+            },
+            message=default_prompt,
         )
 
         record.mark_notified(now)
@@ -197,15 +386,24 @@ class MonitoringService:
         thread_id = response.get("thread_id")
 
         # Log AI suggestion or card content for visibility
-        report_text = _extract_report_text(response)
-        if report_text:
+        exclude_prompts = {default_prompt}
+        if report_text := _extract_report_text(response, exclude=exclude_prompts):
             record.latestReport = report_text
+        elif thread_id:
+            history_report = await _fetch_report_from_history(thread_id, exclude=exclude_prompts)
+            if history_report:
+                record.latestReport = history_report
 
         if response_type == "interrupt":
             record.threadId = thread_id
-            record.mark_hitl()
+            if record.status is not AlertStatus.RECHECK_PENDING:
+                record.mark_hitl()
+                status_tag = "[ALERT][HITL]"
+            else:
+                status_tag = "[ALERT][RECHECK]"
             logger.warning(
-                "[ALERT][HITL] Awaiting user approval for %s (trace=%s, thread=%s, severity=%s)",
+                "%s Awaiting user approval for %s (trace=%s, thread=%s, severity=%s)",
+                status_tag,
                 lp_name,
                 trace_id,
                 thread_id,
@@ -339,7 +537,7 @@ async def get_monitoring_status() -> Dict[str, Any]:
 
 
 @router.post("/human-action")
-async def human_action(payload: HumanActionRequest) -> Dict[str, Any]:
+async def human_action(request: Request, payload: HumanActionRequest):
     """Receive human-in-the-loop actions from Chat UI cards."""
     record = state_manager.get_by_trace(payload.traceId)
     now = datetime.now(timezone.utc)
@@ -381,33 +579,108 @@ async def human_action(payload: HumanActionRequest) -> Dict[str, Any]:
     if not thread_id:
         raise HTTPException(status_code=400, detail="threadId is required for recheck")
 
-    user_message = payload.message or "用户已处理，请复查保证金风险"
+    recheck_message = _build_recheck_message(payload.message)
+    wants_stream = _wants_stream(request)
+
+    async def _refresh_record_metrics(record: AlertRecord) -> None:
+        accounts = await monitoring_service.fetch_lp_data()
+        for account in accounts:
+            if account.get("LP") == record.lp:
+                margin_level = float(account.get("Margin Utilization %", 0.0))
+                record.marginLevel = margin_level
+                severity = config.determine_severity(margin_level)
+                if severity:
+                    record.severity = severity
+                return
+
+    if wants_stream:
+        async def event_stream() -> AsyncIterator[str]:
+            try:
+                yield _format_sse(
+                    {
+                        "status": "recheck_started",
+                        "traceId": record.traceId,
+                        "threadId": thread_id,
+                    },
+                    event="status",
+                )
+
+                async for event in orchestrator_client.stream_resume_margin_check(
+                    thread_id=thread_id,
+                    user_input=recheck_message,
+                ):
+                    name = event.get("event", "message")
+                    data = event.get("data") or {}
+
+                    if name == "final" and isinstance(data, dict):
+                        content = data.get("content")
+                        thread_ref = data.get("thread_id") or thread_id
+                        if not content and thread_ref:
+                            history_report = await _fetch_report_from_history(
+                                thread_ref,
+                                exclude={recheck_message},
+                            )
+                            if history_report:
+                                data = {**data, "content": history_report}
+
+                        annotated = _annotate_recheck_report(
+                            data.get("content"), occurred_at=now
+                        )
+                        if annotated:
+                            data = {**data, "content": annotated}
+                        stripped = _strip_recheck_prompt(data.get("content"))
+                        if stripped is not None:
+                            data = {**data, "content": stripped}
+                    if name == "final":
+                        payload_dict = data if isinstance(data, dict) else {}
+                        _apply_recheck_outcome(
+                            record,
+                            payload_dict,
+                            now=now,
+                            note_recheck=True,
+                        )
+                        await _refresh_record_metrics(record)
+                    yield _format_sse(data if isinstance(data, dict) else {"data": data}, event=name)
+
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("Streaming recheck failed: %s", exc)
+                error_payload = {
+                    "status": "error",
+                    "message": str(exc),
+                    "traceId": record.traceId,
+                }
+                yield _format_sse(error_payload, event="error")
+
+        return StreamingResponse(event_stream(), media_type="text/event-stream")
 
     response = await orchestrator_client.resume_margin_check(
         thread_id=thread_id,
-        user_input=user_message,
+        user_input=recheck_message,
     )
 
-    report_text = _extract_report_text(response)
+    exclude_prompts = {recheck_message}
+    report_text = _extract_report_text(response, exclude=exclude_prompts)
     if report_text:
-        record.latestReport = report_text
+        response = {**response, "content": _strip_recheck_prompt(report_text)}
+    elif thread_id := response.get("thread_id"):
+        history_report = await _fetch_report_from_history(thread_id, exclude=exclude_prompts)
+        if history_report:
+            response = {**response, "content": _strip_recheck_prompt(history_report)}
+
+    _apply_recheck_outcome(record, response, now=now, note_recheck=True)
+    await _refresh_record_metrics(record)
 
     response_type = response.get("type")
     if response_type == "complete":
-        record.mark_resolved(auto=False)
-        record.lastUpdatedAt = now
         logger.info(
             "[ALERT][RESOLVED] %s cleared after recheck (trace=%s, thread=%s)",
             record.lp,
             record.traceId,
-            thread_id,
+            record.threadId,
         )
     elif response_type == "interrupt":
-        record.mark_hitl()
-        record.threadId = response.get("thread_id", thread_id)
-        record.lastUpdatedAt = now
         logger.warning(
-            "[ALERT][HITL] Still pending after recheck for %s (trace=%s, thread=%s)",
+            "[ALERT][RECHECK] Still pending after recheck for %s (trace=%s, thread=%s)",
             record.lp,
             record.traceId,
             record.threadId,
@@ -419,9 +692,27 @@ async def human_action(payload: HumanActionRequest) -> Dict[str, Any]:
             record.lp,
             record.traceId,
         )
-        record.lastUpdatedAt = now
 
     return response
+
+
+@router.get("/history/{trace_id}")
+async def alert_history(trace_id: str) -> Dict[str, Any]:
+    """Expose orchestrator execution history for a given alert trace."""
+
+    record = state_manager.get_by_trace(trace_id)
+    if not record:
+        raise HTTPException(status_code=404, detail="Alert trace not found")
+
+    if not record.threadId:
+        raise HTTPException(status_code=404, detail="History unavailable for this alert")
+
+    history = await orchestrator_client.fetch_history(record.threadId)
+    return {
+        "traceId": trace_id,
+        "threadId": record.threadId,
+        "history": history,
+    }
 
 
 @router.on_event("shutdown")
